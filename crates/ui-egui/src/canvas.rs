@@ -780,6 +780,7 @@ fn view_key(app: &WordApp, dim_body: bool, hidden: Option<&Pos>) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     let v = &app.session.view;
     (v.marks, app.session.prefs.marks, v.show_markup, v.dark_mode, wordcraft_render::DARK_PAPER, v.hide_ink, v.draw.replay).hash(&mut h);
+    (v.read_mode, v.read_page_color).hash(&mut h);
     app.session.prefs.markup.hash(&mut h);
     dim_body.hash(&mut h);
     format!("{:?}{:?}{:?}", app.session.doc.settings.page_color, app.session.doc.settings.page_picture, app.session.doc.settings.watermark)
@@ -920,11 +921,13 @@ fn drawing_grid(body: wordcraft_geom::Rect, step: (f32, f32)) -> (Vec<f32>, Vec<
     (axis(body.x, body.w, step.0), axis(body.y, body.h, step.1))
 }
 
-/// The cells Table Layout › View Gridlines outlines on a page: the body's tables and the
-/// header's and footer's (#1628), skipping cells covered by a merge.
-fn gridline_cells(page: &Page) -> impl Iterator<Item = wordcraft_geom::Rect> + '_ {
-    page.items.iter().chain(&page.header).chain(&page.footer).filter_map(|it| match it {
-        Placed::Cell { rect, covered: false, .. } => Some(*rect),
+/// Global View Gridlines outlines every table (#1628). While editing a header/footer, also
+/// outline that story's cells (#2197), without adding printable borders or changing the view flag.
+fn gridline_cells(page: &Page, all: bool, editing: Option<StoryRef>) -> impl Iterator<Item = wordcraft_geom::Rect> + '_ {
+    // Automatic header/footer guides need not scan a potentially large body placement list.
+    let body = if all { page.items.as_slice() } else { &[] };
+    body.iter().chain(&page.header).chain(&page.footer).filter_map(move |it| match it {
+        Placed::Cell { rect, covered: false, story, .. } if all || Some(*story) == editing => Some(*rect),
         _ => None,
     })
 }
@@ -1059,7 +1062,12 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
         app.canvas.scroll_request = Some(vec2(page as f32 * step, 0.0));
     }
     // View › Switch Modes: dark paper, inverted document colours.
-    let dark_page = app.session.view.dark_mode;
+    // In Read Mode the Page color setting is used instead: Inverse draws the dark page, Sepia
+    // draws sepia paper and None draws white paper.
+    use wordcraft_engine::cmd::view::ReadPageColor;
+    let read_mode = app.session.view.read_mode;
+    let dark_page = if read_mode { app.session.view.read_page_color == ReadPageColor::Inverse } else { app.session.view.dark_mode };
+    let sepia_page = read_mode && app.session.view.read_page_color == ReadPageColor::Sepia;
     let dark_paper = wordcraft_render::DARK_PAPER;
     let show_ruler = app.session.view.ruler
         && app.session.view.mode == wordcraft_layout::ViewMode::Print
@@ -1138,6 +1146,8 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
     let caret = layout.caret_on(&preview_sel(app).unwrap_or(app.session.sel_ends()).focus, app.session.page_hint);
     // Editing a header/footer (or a note) dims the body; once per frame, for every page.
     let dim_body = dims_body(app, &layout);
+    let grid_story = text_box_host(app, &layout).unwrap_or(app.session.sel.focus.story);
+    let grid_story = matches!(part_kind(app, grid_story), Some(PartKind::Header | PartKind::Footer)).then_some(grid_story);
     if let Some(c) = caret
         && !app.session.selects_whole_story()
     {
@@ -1358,7 +1368,15 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
             };
             // Shadow and paper.
             painter.rect_filled(visual_sr.translate(vec2(0.0, 2.0)).expand(1.5), 1.0, t.page_shadow);
-            painter.rect_filled(visual_sr, 0.0, if dark_page { Color32::from_gray(dark_paper) } else { Color32::WHITE });
+            let paper = if dark_page {
+                Color32::from_gray(dark_paper)
+            } else if sepia_page {
+                let s = wordcraft_render::SEPIA_PAPER;
+                Color32::from_rgb(s.0, s.1, s.2)
+            } else {
+                Color32::WHITE
+            };
+            painter.rect_filled(visual_sr, 0.0, paper);
             if tiled {
                 // Render before painting to keep the frame sharp immediately after an edit or
                 // zoom. Tiles are fixed to raster-pixel boundaries, independent of scrolling.
@@ -1460,9 +1478,10 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                     painter.line_segment([pos2(x0, sy), pos2(x1, sy)], stroke);
                 }
             }
-            // Table Layout › View Gridlines: table cell outlines (on screen only).
-            if app.session.view.table_gridlines {
-                for rect in gridline_cells(page) {
+            // The current header/footer's cells have editing guides; explicit View Gridlines
+            // still outlines every table. Neither kind of guide is part of the document.
+            if app.session.view.table_gridlines || grid_story.is_some() {
+                for rect in gridline_cells(page, app.session.view.table_gridlines, grid_story) {
                     let r = Rect::from_min_size(
                         pos2(visual_sr.min.x + rect.x * page_scale, visual_sr.min.y + rect.y * page_scale),
                         vec2(rect.w * page_scale, rect.h * page_scale),
@@ -1941,7 +1960,7 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
     {
         let opts = page_render_options(app, dim_body);
         let bg = if on_visible_page(&rects, &geo.bands, p) {
-            opts.ink(app.session.doc.settings.page_color.unwrap_or(opts.paper))
+            opts.paper_of(&app.session.doc)
         } else {
             let c = Tokens::get(ui.ctx()).canvas;
             wordcraft_doc::props::Rgb(c.r(), c.g(), c.b())
@@ -2127,22 +2146,26 @@ fn balloons(app: &mut WordApp, ui: &mut Ui, painter: &egui::Painter, rects: &[Re
             // Over the page the card goes under the commented line, not on it.
             let top = (anchor.y + if over_page { 4.0 } else { -12.0 }).max(next_y);
             let active = app.canvas.balloon == Some(*id);
-            // Lay out a read-only balloon's text: the comment, then each reply under a rule.
-            let mut lines: Vec<(std::sync::Arc<egui::Galley>, f32)> = Vec::new();
+            // Lay out a read-only balloon's text: the comment, then each reply under a rule, each
+            // with who wrote it and when. (galley, gap above, a rule above)
+            let mut lines: Vec<(std::sync::Arc<egui::Galley>, f32, bool)> = Vec::new();
             let card = if active {
                 Rect::from_min_size(pos2(x0, top), vec2(w, app.canvas.balloon_h.max(24.0)))
             } else {
                 let dim = |r: bool| if r { t.text_dim } else { t.text };
-                lines.push((balloon_text(painter, author, semibold(fs), t.text, w - 16.0), 0.0));
-                let body = app.session.doc.plain_text(StoryRef::Part(c.part));
-                lines.push((balloon_text(painter, body.trim().to_string(), regular(fs), dim(resolved), w - 16.0), 4.0));
-                for rid in &thread {
-                    let Some(r) = app.session.doc.comments.get(rid) else { continue };
-                    lines.push((balloon_text(painter, author_name(&r.author), semibold(fs), t.text, w - 16.0), 9.0));
+                let small = regular((fs * 0.9).max(8.0));
+                for (i, cid) in std::iter::once(*id).chain(thread.iter().copied()).enumerate() {
+                    let Some(r) = app.session.doc.comments.get(&cid) else { continue };
+                    let gap = if i == 0 { 0.0 } else { 9.0 };
+                    lines.push((balloon_text(painter, author_name(&r.author), semibold(fs), t.text, w - 16.0), gap, i > 0));
+                    let when = crate::local_time::comment_time(r);
+                    if !when.is_empty() {
+                        lines.push((balloon_text(painter, when, small.clone(), t.text_dim, w - 16.0), 1.0, false));
+                    }
                     let text = app.session.doc.plain_text(StoryRef::Part(r.part));
-                    lines.push((balloon_text(painter, text.trim().to_string(), regular(fs), dim(resolved), w - 16.0), 4.0));
+                    lines.push((balloon_text(painter, text.trim().to_string(), regular(fs), dim(resolved), w - 16.0), 4.0, false));
                 }
-                let h = lines.iter().map(|(g, gap)| g.size().y + gap).sum::<f32>() + 12.0;
+                let h = lines.iter().map(|(g, gap, _)| g.size().y + gap).sum::<f32>() + 12.0;
                 Rect::from_min_size(pos2(x0, top), vec2(w, h))
             };
             if !card.intersects(clip) {
@@ -2165,9 +2188,9 @@ fn balloons(app: &mut WordApp, ui: &mut Ui, painter: &egui::Painter, rects: &[Re
             } else {
                 card_shapes(painter, &t, card, color, selected, None);
                 let mut y = card.min.y + 6.0;
-                for (i, (g, gap)) in lines.into_iter().enumerate() {
+                for (g, gap, rule) in lines {
                     y += gap;
-                    if i >= 2 && i % 2 == 0 {
+                    if rule {
                         // A reply starts: a hairline between it and what it answers.
                         painter.hline(card.min.x + 10.0..=card.max.x - 8.0, y - gap / 2.0, Stroke::new(1.0, t.border));
                     }
@@ -2339,8 +2362,9 @@ fn balloon_text(painter: &egui::Painter, text: String, font: egui::FontId, color
     painter.layout_job(job)
 }
 
-/// The selected balloon: the comment and its replies as editable fields (each edit is one undo
-/// step via `review.editComment`), an optional reply field, and Reply / Resolve / Delete.
+/// The selected balloon: the comment and its replies, each with who wrote it and when, as
+/// editable fields (each edit is one undo step via `review.editComment`), an optional reply
+/// field, and Reply / Resolve / Delete.
 /// `card` carries last frame's size; returns this frame's.
 #[allow(clippy::too_many_arguments)]
 fn active_balloon(app: &mut WordApp, ui: &mut Ui, painter: &egui::Painter, id: u32, thread: &[u32], card: Rect, fs: f32, color: Color32) -> Rect {
@@ -2354,6 +2378,13 @@ fn active_balloon(app: &mut WordApp, ui: &mut Ui, painter: &egui::Painter, id: u
     let (font, bold, small) = (regular(fs), semibold(fs), regular((fs * 0.9).max(8.0)));
     let focus = std::mem::take(&mut app.canvas.balloon_focus);
     let name = |app: &WordApp, cid: u32| app.session.doc.comments.get(&cid).map(|c| author_name(&c.author)).unwrap_or_default();
+    // When it was written, in local time, under the author.
+    let when = |app: &WordApp, ui: &mut Ui, cid: u32| {
+        let when = app.session.doc.comments.get(&cid).map(crate::local_time::comment_time).unwrap_or_default();
+        if !when.is_empty() {
+            ui.label(egui::RichText::new(when).font(small.clone()).color(t.text_dim));
+        }
+    };
     let resolved = app.session.doc.comments.get(&id).is_some_and(|c| c.resolved);
     child.horizontal(|ui| {
         ui.label(egui::RichText::new(name(app, id)).font(bold.clone()).color(t.text));
@@ -2361,10 +2392,12 @@ fn active_balloon(app: &mut WordApp, ui: &mut Ui, painter: &egui::Painter, id: u
             ui.label(egui::RichText::new(tl!("Resolved")).font(small.clone()).color(t.resolved_text));
         }
     });
+    when(app, &mut child, id);
     crate::panes::comment_editor(app, &mut child, id, Some(font.clone()), focus && !app.canvas.balloon_reply);
     for rid in thread {
         child.add_space(4.0);
         child.label(egui::RichText::new(name(app, *rid)).font(bold.clone()).color(t.text));
+        when(app, &mut child, *rid);
         crate::panes::comment_editor(app, &mut child, *rid, Some(font.clone()), false);
     }
     if app.canvas.balloon_reply && crate::panes::reply_editor(app, &mut child, id, Some(font.clone()), focus) {
@@ -3474,6 +3507,7 @@ fn context_menu(app: &mut WordApp, ui: &mut Ui) {
         item(ui, app, "Change Picture…", "ui.changePicture", json!({}));
         item(ui, app, "Reset Picture", "picture.reset", json!({}));
         item(ui, app, "Size and Crop…", "ui.tab", json!({"tab": "Picture Format"}));
+        item(ui, app, "Crop", "ui.crop", json!({}));
     }
     if picture || object {
         // A numbered caption under (or over) the picture, shape, text box or chart (#1230).
@@ -3586,6 +3620,13 @@ fn page_render_options(app: &WordApp, dim_body: bool) -> wordcraft_render::Rende
     opts.display.revisions = app.session.prefs.markup.clone();
     opts.dark = app.session.view.dark_mode;
     opts.dark_paper = wordcraft_render::DARK_PAPER;
+    // In Read Mode the Page color sets the paper and the dark page, and Switch Modes is ignored.
+    if app.session.view.read_mode {
+        use wordcraft_engine::cmd::view::ReadPageColor;
+        let color = app.session.view.read_page_color;
+        opts.read_paper = Some(if color == ReadPageColor::Sepia { wordcraft_render::SEPIA_PAPER } else { wordcraft_doc::props::Rgb::WHITE });
+        opts.dark = color == ReadPageColor::Inverse;
+    }
     opts.display.dim_header = !dim_body;
     opts.display.dim_body = dim_body;
     opts
@@ -4059,6 +4100,46 @@ mod tests {
         assert_eq!(at(&mut a, 2), Color32::WHITE, "inside a black highlight");
         assert_eq!(at(&mut a, 9), Color32::BLACK, "past it");
         assert_eq!(at(&mut a, 2), Color32::WHITE, "again, from the cache");
+    }
+
+    /// Read Mode › View › Page Color: the reading columns are drawn on white, sepia or a dark
+    /// page, in place of the document's page color; other views keep the page color.
+    #[test]
+    fn read_mode_page_color_sets_the_reading_paper() {
+        use wordcraft_doc::props::Rgb;
+        let mut a = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::from_text("Hello WordCraft")), Default::default());
+        a.run("design.pageColor", json!({"color": "#102040"})).unwrap();
+        let paper = |a: &WordApp| page_render_options(a, false).paper_of(&a.session.doc);
+        assert_eq!(paper(&a), Rgb(0x10, 0x20, 0x40), "Print Layout shows the page color");
+        let print_key = view_key(&a, false, None);
+        a.run("view.readMode", json!({})).unwrap();
+        assert_eq!(paper(&a), Rgb::WHITE, "None: white, the page color ignored");
+        let none_key = view_key(&a, false, None);
+        a.run("view.readPageColor", json!({"value": "sepia"})).unwrap();
+        assert_eq!(paper(&a), wordcraft_render::SEPIA_PAPER);
+        assert!(!page_render_options(&a, false).dark, "Sepia keeps the text's colors");
+        let sepia_key = view_key(&a, false, None);
+        a.run("view.readPageColor", json!({"value": "inverse"})).unwrap();
+        assert!(page_render_options(&a, false).dark);
+        let d = wordcraft_render::DARK_PAPER;
+        assert_eq!(paper(&a), Rgb(d, d, d));
+        let inverse_key = view_key(&a, false, None);
+        let keys = [print_key, none_key, sepia_key, inverse_key];
+        for (i, k) in keys.iter().enumerate() {
+            assert!(!keys[..i].contains(k), "each paper has its own view key");
+        }
+        a.run("view.printLayout", json!({})).unwrap();
+        assert_eq!(paper(&a), Rgb(0x10, 0x20, 0x40), "leaving Read Mode brings the page color back");
+        assert!(!page_render_options(&a, false).dark);
+        // With Switch Modes on, Read Mode's paper still follows the Page color: None is white and Sepia is sepia.
+        a.session.view.dark_mode = true;
+        a.run("view.readMode", json!({})).unwrap();
+        assert!(!page_render_options(&a, false).dark);
+        assert_eq!(paper(&a), Rgb::WHITE);
+        a.run("view.readPageColor", json!({"value": "sepia"})).unwrap();
+        assert_eq!(paper(&a), wordcraft_render::SEPIA_PAPER);
+        a.run("view.printLayout", json!({})).unwrap();
+        assert!(page_render_options(&a, false).dark, "Print Layout keeps Switch Modes");
     }
 
     /// #299: the caret's colour is worked out only when the caret is drawn: with text selected
@@ -6334,12 +6415,18 @@ mod tests {
         };
         let page = Page {
             items: vec![cell(100.0, false, StoryRef::Body), cell(110.0, true, StoryRef::Body)],
-            header: vec![cell(10.0, false, StoryRef::Part(1))],
+            header: vec![cell(10.0, false, StoryRef::Part(1)), cell(20.0, true, StoryRef::Part(1))],
             footer: vec![cell(200.0, false, StoryRef::Part(2))],
             ..Default::default()
         };
-        let ys: Vec<f32> = gridline_cells(&page).map(|r| r.y).collect();
+        let ys: Vec<f32> = gridline_cells(&page, true, None).map(|r| r.y).collect();
         assert_eq!(ys, [100.0, 10.0, 200.0]);
+        let ys: Vec<f32> = gridline_cells(&page, true, Some(StoryRef::Part(2))).map(|r| r.y).collect();
+        assert_eq!(ys, [100.0, 10.0, 200.0], "explicit View Gridlines still shows the other stories");
+        let ys = |editing| gridline_cells(&page, false, editing).map(|r| r.y).collect::<Vec<_>>();
+        assert_eq!(ys(Some(StoryRef::Part(1))), [10.0]);
+        assert_eq!(ys(Some(StoryRef::Part(2))), [200.0]);
+        assert!(ys(None).is_empty(), "closing header/footer editing removes the automatic guides");
     }
 
     #[test]
@@ -7099,6 +7186,63 @@ mod tests {
         h.step();
         assert_eq!(h.state().canvas.ime_preedit_range, None, "the commit clears the range");
         assert!(h.state().session.doc.plain_text(wordcraft_doc::StoryRef::Body).contains("にほん"));
+    }
+
+    #[test]
+    fn context_menu_crop_item_activates_crop_mode() {
+        use egui_kittest::kittest::Queryable;
+        use wordcraft_doc::para::{InlineObject, OBJ};
+        let mut app = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+        let pic =
+            InlineObject::Image { media: "m".into(), w: 200.0, h: 100.0, alt: String::new(), float: Default::default(), crop: [0.0; 4], ole: None };
+        app.session.doc.insert_object(&Pos::body(0, 0), pic, &Default::default()).unwrap();
+        let end = Pos::body(0, OBJ.len_utf8());
+        app.run("select.range", json!({"anchor": Pos::body(0, 0), "focus": end})).unwrap();
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_ui_state(
+            |ui, app: &mut WordApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+        for _ in 0..6 {
+            h.step();
+        }
+        let (page, rect) = h.state_mut().session.layout().object(&Pos::body(0, 0), 0).map(|o| (o.page, o.rect)).expect("laid out");
+        let at = page_to_screen(h.state_mut(), page, rect.x + rect.w / 2.0, rect.y + rect.h / 2.0).expect("on screen");
+        h.event(egui::Event::PointerMoved(at));
+        for pressed in [true, false] {
+            h.event(egui::Event::PointerButton { pos: at, button: egui::PointerButton::Secondary, pressed, modifiers: Default::default() });
+            h.step();
+        }
+        h.step();
+        assert!(h.state().canvas.context_menu_open, "context menu is open on image");
+        h.get_by_label("Crop ").click();
+        for _ in 0..3 {
+            h.step();
+        }
+        assert!(crate::crop::active(h.state()).is_some(), "crop mode is active after clicking Crop in context menu");
+    }
+
+    #[test]
+    fn crop_is_disabled_when_cursor_is_adjacent_without_selection() {
+        let mut app = WordApp::new(wordcraft_engine::Session::new(wordcraft_doc::Document::new()), Default::default());
+        let pic = wordcraft_doc::para::InlineObject::Image {
+            media: "m".into(),
+            w: 200.0,
+            h: 100.0,
+            alt: String::new(),
+            float: Default::default(),
+            crop: [0.0; 4],
+            ole: None,
+        };
+        app.session.doc.insert_object(&Pos::body(0, 0), pic, &Default::default()).unwrap();
+        // Caret is collapsed right at pos 0 (adjacent to the picture).
+        app.session.sel = wordcraft_engine::Selection::caret(Pos::body(0, 0));
+        assert!(crate::ribbon::has_picture_selected(&app.session), "adjacent caret sees picture in ribbon");
+        assert!(!crate::widgets::enabled(&app, "ui.crop"), "ui.crop is disabled when not selected as object");
+        assert!(crate::crop::active(&app).is_none());
     }
 
     fn page_at_index(rects: &[Rect], p: Pos2) -> Option<usize> {
