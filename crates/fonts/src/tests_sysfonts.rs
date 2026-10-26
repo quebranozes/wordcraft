@@ -1,5 +1,5 @@
 //! Installed system fonts: found by family name by every lookup, whatever ran before it (#22).
-
+#[allow(unused_imports)]
 use std::path::{Path, PathBuf};
 
 use super::*;
@@ -270,7 +270,7 @@ fn the_scan_lists_a_variable_fonts_named_instances_as_loading_it_does() {
         return;
     };
     let data = std::fs::read(path).unwrap();
-    let loaded: Vec<(String, String, String)> = enumerate_faces(&data).into_iter().map(|f| (f.family, f.style, f.legacy)).collect();
+    let loaded: Vec<(String, String, String)> = enumerate_faces(&data, MAX_FILE_FACES).into_iter().map(|f| (f.family, f.style, f.legacy)).collect();
     assert_eq!(names(path), loaded);
     if loaded.len() > 1 {
         // Instances other than Regular, Bold and Italic have names of their own.
