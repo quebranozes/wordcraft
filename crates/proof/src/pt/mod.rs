@@ -168,6 +168,20 @@ pub fn installed_path_for(variant: Variant) -> Option<std::path::PathBuf> {
     }
 }
 
+/// The Hunspell name whose load error applies to `variant` now: its own, or `pt_BR` while
+/// European Portuguese falls back to the Brazilian dictionary, so an unreadable `pt_BR` is
+/// reported as such rather than as a missing `pt_PT`. Reads nothing itself.
+pub fn load_error_key(variant: Variant) -> &'static str {
+    load_error_key_of(variant, variant.slot().read().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref())
+}
+
+fn load_error_key_of(variant: Variant, loaded: Option<&Loaded>) -> &'static str {
+    match loaded {
+        Some(Loaded::Brazilian) => Variant::Br.dictionary_name(),
+        _ => variant.dictionary_name(),
+    }
+}
+
 /// Is a Portuguese dictionary available (spelling is checked)?
 pub fn has_dictionary() -> bool {
     !dictionary().is_empty()
@@ -290,6 +304,17 @@ mod tests {
         assert!(matches!(not_installed(Variant::Br), Loaded::Own(d) if d.is_empty()));
         let fallback = Loaded::Brazilian.dictionary();
         assert!(fallback.check("equipe") && !fallback.check("facto"), "the Brazilian words");
+    }
+
+    /// #1028 review: while European Portuguese falls back to the Brazilian dictionary, that one's
+    /// load error is the one to report; otherwise each spelling reports its own.
+    #[test]
+    fn load_errors_follow_the_dictionary_in_use() {
+        let own = Loaded::Own(Arc::new(AffixDict::default()));
+        assert_eq!(load_error_key_of(Variant::Pt, Some(&Loaded::Brazilian)), "pt_BR");
+        assert_eq!(load_error_key_of(Variant::Pt, Some(&own)), "pt_PT");
+        assert_eq!(load_error_key_of(Variant::Pt, None), "pt_PT", "not looked for yet");
+        assert_eq!(load_error_key_of(Variant::Br, Some(&own)), "pt_BR");
     }
 
     /// Each spelling finds its own file; European Portuguese reports the Brazilian file it falls

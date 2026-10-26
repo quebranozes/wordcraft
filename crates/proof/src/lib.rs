@@ -205,7 +205,7 @@ pub fn dictionary_load_error(lang: ProofLang) -> Option<String> {
     let key = match lang {
         ProofLang::Pl => "pl_PL",
         ProofLang::Pt => "pt_BR",
-        ProofLang::PtPt => "pt_PT",
+        ProofLang::PtPt => pt::load_error_key(pt::Variant::Pt),
         ProofLang::It => "it_IT",
         ProofLang::Hr => "hr_HR",
         ProofLang::Tr => "tr_TR",
@@ -439,6 +439,8 @@ pub fn missing_dictionary(lang: Option<&str>) -> Option<&'static str> {
 pub fn unreadable_dictionary(lang: Option<&str>) -> Option<(&'static str, std::path::PathBuf, String)> {
     let lang = ProofLang::from_tag(lang);
     let name = dictionary_needed(lang, dictionary_loaded(lang)?)?;
+    // European Portuguese without a `pt_PT` reads `pt_BR`: an unreadable one is the problem.
+    let name = if lang == ProofLang::PtPt { pt::load_error_key(pt::Variant::Pt) } else { name };
     hunspell::load_error(name).map(|(file, reason)| (name, file, reason))
 }
 
